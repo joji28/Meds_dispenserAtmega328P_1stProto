@@ -1,0 +1,1010 @@
+//rtc ds3231 + stepper
+#include <avr/io.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+#define F_CPU 1000000UL
+#include "font.h"
+#include <stdlib.h>
+#include <stdio.h>
+
+
+//stepper pins
+#define COIL_PORT PORTD
+#define COIL_DDR  DDRD
+
+//stepper
+// Half-step sequence: 8 steps
+const uint8_t step_sequence[8] = {
+	0b0001,  // Step 1: Coil 1
+	0b0011,  // Step 2: Coil 1+2
+	0b0010,  // Step 3: Coil 2
+	0b0110,  // Step 4: Coil 2+3
+	0b0100,  // Step 5: Coil 3
+	0b1100,  // Step 6: Coil 3+4
+	0b1000,  // Step 7: Coil 4
+	0b1001   // Step 8: Coil 4+1
+};
+
+//oled
+#define OLED_ADDR 0x78 // 0x3C << 1 (I²C write address)
+
+//rtc
+#define DS3231_ADDRESS 0x68
+
+
+// OLED SSD1306 definitions
+#define SSD1306_ADDRESS 0x3C
+#define SSD1306_WIDTH 128
+#define SSD1306_HEIGHT 64
+
+
+// Function to rotate the motor by given number of steps
+void step_motor(uint16_t steps) {
+	for (uint16_t i = 0; i < steps; i++) {
+		uint8_t phase = i % 8;
+		COIL_PORT = (COIL_PORT & 0xF0) | step_sequence[phase];
+		_delay_us(3000);
+	}
+	// Turn off coils
+	COIL_PORT &= 0xF0;
+}
+
+
+//i2c
+void I2C_Init() {
+	TWSR = 0x00;  // Prescaler = 1
+	TWBR = 12;  // SCL frequency = 100kHz at 16MHz
+	TWCR = (1<<TWEN);  // Enable TWI
+	//_delay_ms(10);
+}
+
+
+void I2C_Start() {
+	TWCR = (1<<TWINT)|(1<<TWSTA)|(1<<TWEN);
+	while (!(TWCR & (1<<TWINT)));
+}
+
+void I2C_Stop() {
+	TWCR = (1<<TWINT)|(1<<TWSTO)|(1<<TWEN);
+}
+
+void I2C_Write(uint8_t data) {
+	TWDR = data;
+	TWCR = (1<<TWINT)|(1<<TWEN);
+	while (!(TWCR & (1<<TWINT)));
+}
+
+uint8_t I2C_ReadACK() {
+	TWCR = (1<<TWINT)|(1<<TWEN)|(1<<TWEA);
+	while (!(TWCR & (1<<TWINT)));
+	return TWDR;
+}
+
+uint8_t I2C_ReadNACK() {
+	TWCR = (1<<TWINT)|(1<<TWEN);
+	while (!(TWCR & (1<<TWINT)));
+	return TWDR;
+}
+
+///set
+void DS3231_SetTime(uint8_t min, uint8_t hour) {
+	I2C_Start();
+	I2C_Write(DS3231_ADDRESS << 1);  // Device address + write
+	I2C_Write(0x00);  // Start at register 0 (seconds)
+	uint8_t sec = 0;
+	// Convert values to BCD format
+	I2C_Write((sec/10)<<4 | (sec%10));    // Seconds
+	I2C_Write((min/10)<<4 | (min%10));    // Minutes
+	I2C_Write((hour/10)<<4 | (hour%10));  // Hours (24-hour format)
+	uint8_t dow =1;
+	I2C_Write(dow);                       // Day of week (1-7)
+	uint8_t dom =1;
+	I2C_Write((dom/10)<<4 | (dom%10));    // Day of month
+	uint8_t month =1;
+	I2C_Write((month/10)<<4 | (month%10));// Month
+	uint8_t year = 25;
+	I2C_Write((year/10)<<4 | (year%10));  // Year (00-99)
+	
+	I2C_Stop();
+}
+
+//read
+void DS3231_GetTime(uint8_t *sec, uint8_t *min, uint8_t *hour, uint8_t *dow, uint8_t *dom, uint8_t *month, uint8_t *year) {
+	I2C_Start();
+	I2C_Write(DS3231_ADDRESS << 1);  // Device address + write
+	I2C_Write(0x00);  // Start at register 0
+	I2C_Stop();
+	
+	I2C_Start();
+	I2C_Write((DS3231_ADDRESS << 1) | 0x01);  // Device address + read
+	
+	// Read registers and convert from BCD
+	uint8_t data = I2C_ReadACK();
+	*sec = (data >> 4)*10 + (data & 0x0F);
+	
+	data = I2C_ReadACK();
+	*min = (data >> 4)*10 + (data & 0x0F);
+	
+	data = I2C_ReadACK();
+	*hour = (data >> 4)*10 + (data & 0x0F);
+	
+	data = I2C_ReadACK();
+	*dow = data & 0x07;
+	
+	data = I2C_ReadACK();
+	*dom = (data >> 4)*10 + (data & 0x0F);
+	
+	data = I2C_ReadACK();
+	*month = (data >> 4)*10 + (data & 0x0F);
+	
+	data = I2C_ReadNACK();
+	*year = (data >> 4)*10 + (data & 0x0F);
+	
+	I2C_Stop();
+}
+
+
+
+void OLED_Command(uint8_t cmd) {
+	I2C_Start();
+	I2C_Write(OLED_ADDR);
+	I2C_Write(0x00); // Control byte: Co=0, D/C=0 (command)
+	I2C_Write(cmd);
+	I2C_Stop();
+}
+
+void OLED_Data(uint8_t data) {
+	I2C_Start();
+	I2C_Write(OLED_ADDR);
+	I2C_Write(0x40); // Control byte: Co=0, D/C=1 (data)
+	I2C_Write(data);
+	I2C_Stop();
+}
+
+void OLED_Init() {
+	// Initialization sequence
+	OLED_Command(0xAE); // Display OFF
+	OLED_Command(0xD5); OLED_Command(0x80); // Set oscillator freq
+	OLED_Command(0xA8); OLED_Command(0x3F); // Set multiplex ratio (64)
+	OLED_Command(0xD3); OLED_Command(0x00); // Set display offset
+	OLED_Command(0x40); // Set display start line
+	OLED_Command(0x8D); OLED_Command(0x14); // Enable charge pump
+	OLED_Command(0x20); OLED_Command(0x00); // Horizontal addressing
+	OLED_Command(0xA1); // Segment remap (flip horizontal)
+	OLED_Command(0xC8); // COM output scan (flip vertical)
+	OLED_Command(0xDA); OLED_Command(0x12); // COM pins config
+	OLED_Command(0x81); OLED_Command(0xCF); // Set contrast
+	OLED_Command(0xD9); OLED_Command(0xF1); // Pre-charge period
+	OLED_Command(0xDB); OLED_Command(0x40); // VCOMH deselect
+	OLED_Command(0xA4); // Display resume
+	OLED_Command(0xA6); // Normal display (non-inverted)
+	OLED_Command(0xAF); // Display ON
+}
+
+uint8_t oled_buffer[1024]; // 128 columns × 8 pages
+
+void OLED_Update() {
+	// Set column range (0-127)
+	OLED_Command(0x21); OLED_Command(0x00); OLED_Command(0x7F);
+	// Set page range (0-7)
+	OLED_Command(0x22); OLED_Command(0x00); OLED_Command(0x07);
+
+	// Send entire buffer
+	for (uint16_t i = 0; i < 1024; i++) {
+		OLED_Data(oled_buffer[i]);
+	}
+}
+void OLED_SetPixel(uint8_t x, uint8_t y, uint8_t color) {
+	if (x >= 128 || y >= 64) return; // Bounds check
+	uint8_t page = y / 8;
+	uint8_t bit_mask = 1 << (y % 8);
+	uint16_t index = x + (page * 128);
+
+	if (color) oled_buffer[index] |= bit_mask;  // Set pixel
+	else oled_buffer[index] &= ~bit_mask;       // Clear pixel
+}
+void OLED_ClearBuffer() {
+	// Set entire buffer to 0 (clear all pixels)
+	for (uint16_t i = 0; i < 1024; i++) {
+		oled_buffer[i] = 0x00;
+	}
+}
+
+void OLED_DrawHLine(uint8_t x, uint8_t y, uint8_t w) {
+	for(uint8_t i = x; i < x+w; i++) {
+		OLED_SetPixel(i, y, 1);
+	}
+}
+
+void OLED_DrawVLine(uint8_t x, uint8_t y, uint8_t h) {
+	for(uint8_t i = y; i < y+h; i++) {
+		OLED_SetPixel(x, i, 1);
+	}
+}
+
+void OLED_DrawRect(uint8_t x, uint8_t y, uint8_t w, uint8_t h) {
+	OLED_DrawHLine(x, y, w);          // Top
+	OLED_DrawHLine(x, y+h-1, w);      // Bottom
+	OLED_DrawVLine(x, y, h);          // Left
+	OLED_DrawVLine(x+w-1, y, h);      // Right
+}
+
+void OLED_FillRect(uint8_t x, uint8_t y, uint8_t w, uint8_t h) {
+	for(uint8_t i = y; i < y+h; i++) {
+		OLED_DrawHLine(x, i, w);
+	}
+}
+
+
+
+void OLED_DrawChar(uint8_t x, uint8_t y, char c) {
+	// Convert to lowercase first if needed
+	//c = tolower(c);
+	
+	// Only accept space (32) to 'z' (122)
+	if (c < 32 || c > 122) return;
+	
+	// Calculate font index - special handling for lowercase
+	uint16_t idx;
+	if (c >= 'a' && c <= 'z') {
+		idx = (c - 'a' + 26 + 26 + 6) * 5;  // Skip uppercase/symbols
+		} else {
+		idx = (c - ' ') * 5;
+	}
+	
+	// Read from PROGMEM with bounds checking
+	for (uint8_t i = 0; i < 5; i++) {
+		if (idx + i >= sizeof(font5x7)) return;  // Prevent overflow
+		uint8_t col = pgm_read_byte(&font5x7[idx + i]);
+		for (uint8_t j = 0; j < 7; j++) {
+			if (col & (1 << j)) {
+				OLED_SetPixel(x + i, y + j, 1);
+			}
+		}
+	}
+}
+void OLED_DrawString(uint8_t x, uint8_t y, const char *str) {
+	while (*str) {
+		char c = *str++;
+		//if (c >= 'a' && c <= 'z') c = toupper(c);  // Auto-uppercase
+		
+		// Only draw if character is in font range
+		if (c >= ' ' && c <= 'Z') {
+			OLED_DrawChar(x, y, c);
+			x += 6;  // 5px char + 1px spacing
+			if (x > 122) {  // Screen edge check
+				x = 0;
+				y += 8;
+			}
+		}
+	}
+}
+
+#define BUTTON_UP_PIN     PD2
+#define BUTTON_SELECT_PIN PD3
+
+// Global variables
+volatile uint8_t current_number = 0;
+volatile bool number_selected = false;
+uint8_t selected_minutes = 0;  // Store minutes here
+uint8_t selected_hours = 0;    // Store hours here
+uint8_t ST_hr = 0;
+uint8_t ST_min = 0;
+
+volatile uint8_t select_key = 0;
+volatile uint8_t phase_key = 0;
+
+
+uint8_t set_mins = 0;
+uint8_t set_hrs = 0;
+
+uint8_t Mor_mins = 0;
+uint8_t Mor_hrs = 0;
+
+uint8_t Aft_mins = 0;
+uint8_t Aft_hrs = 0;
+
+uint8_t Ngt_mins = 0;
+uint8_t Ngt_hrs = 0;
+
+// Function prototypes
+void init_buttons();
+bool is_button_pressed(uint8_t pin);
+
+uint8_t set_selector_0_to_59();
+uint8_t set_selector_0_to_23();
+
+uint8_t Mor_selector_0_to_59();
+uint8_t Mor_selector_0_to_23();
+
+uint8_t Aft_selector_0_to_59();
+uint8_t Aft_selector_0_to_23();
+
+uint8_t Ngt_selector_0_to_59();
+uint8_t Ngt_selector_0_to_23();
+
+
+
+//setting current minutes
+uint8_t set_selector_0_to_59()
+{
+
+	while(1) {
+		OLED_ClearBuffer();
+		OLED_DrawString(0,0, "SET CURRENT TIME:");
+		OLED_DrawString(5, 15, "SET MINUTES:");
+		//OLED_Update();
+		
+		// Display current number
+		char buffer[3];
+		if(current_number < 10) {
+			buffer[0] = '0';
+			buffer[1] = current_number + '0';
+			buffer[2] = '\0';
+			} else {
+			itoa(current_number, buffer, 10);
+		}
+		OLED_DrawString(80, 15, buffer);
+		
+		// Button handling
+		if(is_button_pressed(BUTTON_UP_PIN))
+		 {
+			_delay_ms(50); // Debounce delay
+			
+			// Increment in steps of 15, wrapping at 59
+			if(current_number < 45) 
+			{
+				current_number += 15;
+			}
+			else if(current_number == 45) 
+			{
+				current_number = 59; // Special case for 45?59
+			}
+			else 
+			{
+				current_number = 0; // Wrap around (59?0)
+			}
+			
+			while(is_button_pressed(BUTTON_UP_PIN)); // Wait for button release
+			_delay_ms(50); // Final debounce
+		}
+		
+		
+		if(is_button_pressed(BUTTON_SELECT_PIN)) 
+		{
+			_delay_ms(50);
+			number_selected = !number_selected;
+			
+			if(number_selected)
+			 {
+				return current_number; // Return selected minutes
+			}
+			
+			while(is_button_pressed(BUTTON_SELECT_PIN));
+			_delay_ms(50);
+		}
+		OLED_Update();
+	}
+}
+
+
+//setting current hour
+uint8_t set_selector_0_to_23()
+{
+	while(1)
+	{
+		OLED_ClearBuffer();
+		OLED_DrawString(0,0, "SET CURRENT TIME:");
+		OLED_DrawString(5, 15, "SET HOURS:");
+		
+		// Display current number
+		char buffer[3];
+		if(current_number < 10)
+		{
+			buffer[0] = '0';
+			buffer[1] = current_number + '0';
+			buffer[2] = '\0';
+		}
+		else {
+			itoa(current_number, buffer, 10);
+		}
+		OLED_DrawString(80, 15, buffer);
+		
+		// Button handling
+		if(is_button_pressed(BUTTON_UP_PIN))
+		{
+			_delay_ms(50);
+			current_number = (current_number < 23) ? current_number + 1 : 0;
+			while(is_button_pressed(BUTTON_UP_PIN));
+			_delay_ms(50);
+		}
+		
+		if(is_button_pressed(BUTTON_SELECT_PIN))
+		{
+			_delay_ms(50);
+			return current_number; // Return selected hours immediately
+		}
+		OLED_Update();
+	}
+}
+
+
+//setting morning minutes
+uint8_t Mor_selector_0_to_59()
+{
+	
+	while(1) {
+		OLED_ClearBuffer();
+		OLED_DrawString(0,0, "SET MORNING TIME:");
+		OLED_DrawString(5, 15, "SET MINUTES:");
+		
+		// Display current number
+		char buffer[3];
+		if(current_number < 10) {
+			buffer[0] = '0';
+			buffer[1] = current_number + '0';
+			buffer[2] = '\0';
+			} else {
+			itoa(current_number, buffer, 10);
+		}
+		OLED_DrawString(80, 15, buffer);
+		
+		// Button handling
+		if(is_button_pressed(BUTTON_UP_PIN)) {
+			_delay_ms(50); // Debounce delay
+			
+			// Increment in steps of 15, wrapping at 59
+			if(current_number < 45) {
+				current_number += 15;
+			}
+			else if(current_number == 45) {
+				current_number = 59; // Special case for 45?59
+			}
+			else {
+				current_number = 0; // Wrap around (59?0)
+			}
+			
+			while(is_button_pressed(BUTTON_UP_PIN)); // Wait for button release
+			_delay_ms(50); // Final debounce
+		}
+		
+		
+		if(is_button_pressed(BUTTON_SELECT_PIN)) {
+			_delay_ms(50);
+			number_selected = !number_selected;
+			
+			if(number_selected) {
+				return current_number; // Return selected minutes
+			}
+			
+			while(is_button_pressed(BUTTON_SELECT_PIN));
+			_delay_ms(50);
+		}
+		OLED_Update();
+	}
+}
+
+
+//setting morning hour
+uint8_t Mor_selector_0_to_23()
+{
+	while(1) {
+		OLED_ClearBuffer();
+		OLED_DrawString(0,0, "SET MORNING TIME:");
+		OLED_DrawString(5, 15, "SET HOURS:");
+		
+		// Display current number
+		char buffer[3];
+		if(current_number < 10) {
+			buffer[0] = '0';
+			buffer[1] = current_number + '0';
+			buffer[2] = '\0';
+			} else {
+			itoa(current_number, buffer, 10);
+		}
+		OLED_DrawString(80, 15, buffer);
+		
+		// Button handling
+		if(is_button_pressed(BUTTON_UP_PIN)) {
+			_delay_ms(50);
+			current_number = (current_number < 23) ? current_number + 1 : 0;
+			while(is_button_pressed(BUTTON_UP_PIN));
+			_delay_ms(50);
+		}
+		
+		if(is_button_pressed(BUTTON_SELECT_PIN)) {
+			_delay_ms(50);
+			return current_number; // Return selected hours immediately
+		}
+		OLED_Update();
+	}
+	
+}
+
+
+//setting afternoon minutes
+uint8_t Aft_selector_0_to_59()
+{
+	while(1) {
+		OLED_ClearBuffer();
+		OLED_DrawString(0,0, "SET AFTERNOON TIME:");
+		OLED_DrawString(5, 15, "SET MINUTES:");
+		
+		// Display current number
+		char buffer[3];
+		if(current_number < 10) {
+			buffer[0] = '0';
+			buffer[1] = current_number + '0';
+			buffer[2] = '\0';
+			} else {
+			itoa(current_number, buffer, 10);
+		}
+		OLED_DrawString(80, 15, buffer);
+		
+		// Button handling
+		if(is_button_pressed(BUTTON_UP_PIN)) {
+			_delay_ms(50); // Debounce delay
+			
+			// Increment in steps of 15, wrapping at 59
+			if(current_number < 45) {
+				current_number += 15;
+			}
+			else if(current_number == 45) {
+				current_number = 59; // Special case for 45?59
+			}
+			else {
+				current_number = 0; // Wrap around (59?0)
+			}
+			
+			while(is_button_pressed(BUTTON_UP_PIN)); // Wait for button release
+			_delay_ms(50); // Final debounce
+		}
+		
+		
+		if(is_button_pressed(BUTTON_SELECT_PIN)) {
+			_delay_ms(50);
+			number_selected = !number_selected;
+			
+			if(number_selected) {
+				return current_number; // Return selected minutes
+			}
+			
+			while(is_button_pressed(BUTTON_SELECT_PIN));
+			_delay_ms(50);
+		}
+		OLED_Update();
+	}
+	
+}
+
+
+//setting afternoon hour
+uint8_t Aft_selector_0_to_23()
+{
+	while(1) {
+		OLED_ClearBuffer();
+		OLED_DrawString(0,0, "SET AFTERNOON TIME:");
+		OLED_DrawString(5, 15, "SET HOURS:");
+		
+		// Display current number
+		char buffer[3];
+		if(current_number < 10) {
+			buffer[0] = '0';
+			buffer[1] = current_number + '0';
+			buffer[2] = '\0';
+			} else {
+			itoa(current_number, buffer, 10);
+		}
+		OLED_DrawString(80, 15, buffer);
+		
+		// Button handling
+		if(is_button_pressed(BUTTON_UP_PIN)) {
+			_delay_ms(50);
+			current_number = (current_number < 23) ? current_number + 1 : 0;
+			while(is_button_pressed(BUTTON_UP_PIN));
+			_delay_ms(50);
+		}
+		
+		if(is_button_pressed(BUTTON_SELECT_PIN)) {
+			_delay_ms(50);
+			return current_number; // Return selected hours immediately
+		}
+		OLED_Update();
+	}
+}
+
+
+//setting night minutes
+uint8_t Ngt_selector_0_to_59()
+{
+	while(1) {
+		OLED_ClearBuffer();
+		OLED_DrawString(0,0, "SET NIGHT TIME:");
+		OLED_DrawString(5, 15, "SET MINUTES:");
+		
+		// Display current number
+		char buffer[3];
+		if(current_number < 10) {
+			buffer[0] = '0';
+			buffer[1] = current_number + '0';
+			buffer[2] = '\0';
+			} else {
+			itoa(current_number, buffer, 10);
+		}
+		OLED_DrawString(80, 15, buffer);
+		
+		// Button handling
+		if(is_button_pressed(BUTTON_UP_PIN)) {
+			_delay_ms(50); // Debounce delay
+			
+			// Increment in steps of 15, wrapping at 59
+			if(current_number < 45) {
+				current_number += 15;
+			}
+			else if(current_number == 45) {
+				current_number = 59; // Special case for 45?59
+			}
+			else {
+				current_number = 0; // Wrap around (59?0)
+			}
+			
+			while(is_button_pressed(BUTTON_UP_PIN)); // Wait for button release
+			_delay_ms(50); // Final debounce
+		}
+		
+		
+		if(is_button_pressed(BUTTON_SELECT_PIN)) {
+			_delay_ms(50);
+			number_selected = !number_selected;
+			
+			if(number_selected) {
+				return current_number; // Return selected minutes
+			}
+			
+			while(is_button_pressed(BUTTON_SELECT_PIN));
+			_delay_ms(50);
+		}
+		OLED_Update();
+	}
+	
+}
+
+
+//setting night hours
+uint8_t Ngt_selector_0_to_23()
+{
+	while(1) {
+		OLED_ClearBuffer();
+		OLED_DrawString(0,0, "SET NIGHT TIME:");
+		OLED_DrawString(5, 15, "SET HOURS:");
+		
+		// Display current number
+		char buffer[3];
+		if(current_number < 10) {
+			buffer[0] = '0';
+			buffer[1] = current_number + '0';
+			buffer[2] = '\0';
+			} else {
+			itoa(current_number, buffer, 10);
+		}
+		OLED_DrawString(80, 15, buffer);
+		
+		// Button handling
+		if(is_button_pressed(BUTTON_UP_PIN)) {
+			_delay_ms(50);
+			current_number = (current_number < 23) ? current_number + 1 : 0;
+			while(is_button_pressed(BUTTON_UP_PIN));
+			_delay_ms(50);
+		}
+		
+		if(is_button_pressed(BUTTON_SELECT_PIN)) {
+			_delay_ms(50);
+			return current_number; // Return selected hours immediately
+		}
+		OLED_Update();
+	}
+}
+
+// Button initialization
+void init_buttons() {
+	DDRD &= ~((1 << BUTTON_UP_PIN) | (1 << BUTTON_SELECT_PIN));
+	PORTD |= (1 << BUTTON_UP_PIN) | (1 << BUTTON_SELECT_PIN);
+}
+
+
+
+// Button press detection
+bool is_button_pressed(uint8_t pin) {
+	return !(PIND & (1 << pin));
+}
+
+int main(void)																				//MAIN LOOP------------------------
+{
+	I2C_Init();
+	// Initialize OLED
+	OLED_Init(); // Assuming you have this initialization function
+	OLED_ClearBuffer();
+	//OLED_Update();
+	
+	// Initialize buttons
+	init_buttons();
+	uint8_t select_key = 0;
+	uint8_t phase_key = 0;
+	uint8_t current_number = 0;
+	number_selected = false;
+	//
+	COIL_DDR |= 0x0F;
+		COIL_PORT &= 0xF0;
+		DDRB |= 0x07;
+DDRB |= (1 << PB0);  // Set PB0 as output (debug LED)
+uint8_t triggered = 0;
+OLED_ClearBuffer();
+OLED_DrawString(10, 10, "INITIALIZING...");
+OLED_Update();
+_delay_ms(1000);
+//I2C_Init();	
+	//1st phase - setting current time
+	//OLED_ClearBuffer();
+	while(1)
+	{
+	if ((select_key == 0 || select_key == 1) && phase_key == 0) //1st phase
+	{
+		OLED_ClearBuffer();
+		OLED_DrawString(10, 20, "PHASE1");
+		OLED_Update();
+
+		
+		if (select_key == 0)
+		{
+				OLED_ClearBuffer();
+				OLED_DrawString(10, 30, "PHASE2");
+				/*OLED_Update();*/
+
+			//OLED_Update();
+	
+			set_mins = set_selector_0_to_59(); // This will block until selection
+			select_key = 1; // Move to hours selection
+			current_number = 0; // Reset counter for hours
+			//number_selected = false;
+		}//inner if
+		
+		else if (select_key == 1)
+		{
+			
+			OLED_Update();
+			
+			set_hrs = set_selector_0_to_23(); // This will block until selection
+			
+			// Display final time
+			OLED_ClearBuffer();
+			char time_str[12];
+			time_str[0] = '0' + set_hrs/10;
+			time_str[1] = '0' + set_hrs%10;
+			time_str[2] = ':';
+			time_str[3] = '0' + set_mins/10;
+			time_str[4] = '0' + set_mins%10;
+			time_str[5] = '\0';
+			OLED_DrawRect(5,5,120,40);
+			OLED_DrawString(0, 10, "CURRENT TIME SET TO:");
+			OLED_DrawString(10, 25, time_str);
+			OLED_DrawString(50, 25, "HRS");
+			OLED_Update();
+			_delay_ms(4000);
+			
+			select_key = 2;
+			phase_key = 1;
+			current_number = 0;
+			ST_hr = set_hrs;
+			ST_min = set_mins;
+			DS3231_SetTime(ST_min, ST_hr);
+			
+		}//INNER ELSE
+		/*OLED_Update();*/
+	}//outer if
+	OLED_Update();
+	
+	
+	
+// 	//2nd phase - Morning
+// 	//OLED_ClearBuffer();
+// 	if ((select_key == 2 || select_key == 3) && phase_key == 1) //2nd phase - Morning
+// 	{
+// 		OLED_ClearBuffer();
+// 		if (select_key == 2)
+// 		{
+// 			// Minutes selection phase
+// 			// 				OLED_DrawString(0,0, "SET CURRENT TIME:");
+// 			// 				OLED_DrawString(5, 15, "SET MINUTES:");
+// 			OLED_Update();
+// 			
+// 			Mor_mins = Mor_selector_0_to_59(); // This will block until selection
+// 			select_key = 3; // Move to hours selection
+// 			current_number = 0; // Reset counter for hours
+// 			//number_selected = false;
+// 		}//inner if
+// 		
+// 		else if (select_key == 3)
+// 		{
+// 			// Hours selection phase
+// 			
+// 			/*OLED_DrawString(5, 35, "SET HOURS:");*/
+// 			OLED_Update();
+// 			
+// 			Mor_hrs = Mor_selector_0_to_23(); // This will block until selection
+// 			
+// 			// Display final time
+// 			OLED_ClearBuffer();
+// 			char time_str[12];
+// 			time_str[0] = '0' + Mor_hrs/10;
+// 			time_str[1] = '0' + Mor_hrs%10;
+// 			time_str[2] = ':';
+// 			time_str[3] = '0' + Mor_mins/10;
+// 			time_str[4] = '0' + Mor_mins%10;
+// 			time_str[5] = '\0';
+// 			OLED_DrawRect(0,0,120,40);
+// 			OLED_DrawString(0, 10, "MORNING TIME SET TO:");
+// 			OLED_DrawString(20, 25, time_str);
+// 			OLED_DrawString(60, 25, "HRS");
+// 			OLED_Update();
+// 			_delay_ms(4000);
+// 			
+// 			select_key = 4;
+// 			phase_key = 2;
+// 			current_number = 0;
+// 			
+// 		}//INNER ELSE
+// 	}//outer if
+// 	
+// 	//3rd phase - Afternoon
+// 	//OLED_ClearBuffer();
+// 	if ((select_key == 4 || select_key == 5) && phase_key == 2)
+// 	{
+// 		OLED_ClearBuffer();
+// 		if (select_key == 4)
+// 		{
+// 			
+// 			OLED_Update();
+// 			
+// 			Aft_mins = Aft_selector_0_to_59(); // This will block until selection
+// 			select_key = 5; // Move to hours selection
+// 			current_number = 0; // Reset counter for hours
+// 			//number_selected = false;
+// 		}//inner if
+// 		
+// 		else if (select_key == 5)
+// 		{
+// 			// Hours selection phase
+// 			
+// 			/*OLED_DrawString(5, 35, "SET HOURS:");*/
+// 			OLED_Update();
+// 			
+// 			Aft_hrs = Aft_selector_0_to_23(); // This will block until selection
+// 			
+// 			// Display final time
+// 			OLED_ClearBuffer();
+// 			char time_str[12];
+// 			time_str[0] = '0' + Aft_hrs/10;
+// 			time_str[1] = '0' + Aft_hrs%10;
+// 			time_str[2] = ':';
+// 			time_str[3] = '0' + Aft_mins/10;
+// 			time_str[4] = '0' + Aft_mins%10;
+// 			time_str[5] = '\0';
+// 			OLED_DrawRect(0,0,120,40);
+// 			OLED_DrawString(0, 10, "AFTERNOON TIME SET TO:");
+// 			OLED_DrawString(20, 25, time_str);
+// 			OLED_DrawString(60, 25, "HRS");
+// 			OLED_Update();
+// 			_delay_ms(4000);
+// 			
+// 			select_key = 6;
+// 			phase_key = 3;
+// 			current_number = 0;
+// 			
+// 		}//INNER ELSE
+// 	}//outer if
+// 	
+// 	
+// 	//4th phase - Night
+// 	/*		OLED_ClearBuffer();*/
+// 	if ((select_key == 6 || select_key == 7) && phase_key == 3)
+// 	{
+// 		
+// 		OLED_ClearBuffer();
+// 		if (select_key == 6)
+// 		{
+// 			
+// 			OLED_Update();
+// 			
+// 			Ngt_mins = Ngt_selector_0_to_59(); // This will block until selection
+// 			select_key = 7; // Move to hours selection
+// 			current_number = 0; // Reset counter for hours
+// 			//number_selected = false;
+// 		}//inner if
+// 		
+// 		else if (select_key == 7)
+// 		{
+// 			
+// 			OLED_Update();
+// 			
+// 			Ngt_hrs = Ngt_selector_0_to_23(); // This will block until selection
+// 			
+// 			// Display final time
+// 			OLED_ClearBuffer();
+// 			char time_str[12];
+// 			time_str[0] = '0' + Ngt_hrs/10;
+// 			time_str[1] = '0' + Ngt_hrs%10;
+// 			time_str[2] = ':';
+// 			time_str[3] = '0' + Ngt_mins/10;
+// 			time_str[4] = '0' + Ngt_mins%10;
+// 			time_str[5] = '\0';
+// 			OLED_DrawRect(5,5,120,40);
+// 			OLED_DrawString(0, 10, "NIGHT TIME SET TO:");
+// 			OLED_DrawString(10, 25, time_str);
+// 			OLED_DrawString(50, 25, "HRS");
+// 			OLED_Update();
+// 			_delay_ms(4000);
+// 			
+// 			select_key = 8;
+// 			phase_key = 4;
+// 			current_number = 0;
+// 			
+// 		}//INNER ELSE
+// 	}//outer if
+// 	
+// 	
+// 	//completed message
+// 	/*		OLED_ClearBuffer();*/
+// 	if (select_key == 8 && phase_key == 4)
+// 	
+// 	{
+// 		OLED_ClearBuffer();
+// 		OLED_DrawString(10,30, "COMPLETED");
+// 		OLED_Update();
+// 		_delay_ms(3000);
+// 		
+// 	}
+// 	
+	//OLED_Update();
+	
+	//
+	// 		//rtc_inputs_outputs
+	// 		    DS3231_GetTime(&sec, &min, &hour, &dow, &dom, &month, &year);
+	//
+	//     // Morning (PB0)
+	//     if (hour == Mor_hrs && min == Mor_mins && sec == 0 && triggered != 1) {
+	//         triggered = 1;
+	//         PORTB |= (1 << PB0);
+	//         _delay_ms(2000);
+	//         PORTB &= ~(1 << PB0);
+	//     }
+	//     // Afternoon (PB1)
+	//     else if (hour == Aft_hrs && min == Aft_mins && sec == 0 && triggered != 2) {
+	//         triggered = 2;
+	//         PORTB |= (1 << PB1);
+	//         _delay_ms(2000);
+	//         PORTB &= ~(1 << PB1);
+	//     }
+	//     // Night (PB2)
+	//     else if (hour == Ngt_hrs && min == Ngt_mins && sec == 0 && triggered != 0) {
+	//         triggered = 0;
+	//         PORTB |= (1 << PB2);
+	//         _delay_ms(2000);
+	//         PORTB &= ~(1 << PB2);
+	//     }
+	//
+	//     _delay_ms(10); // Poll every 10ms
+
+
+	
+	
+	
+	
+	
+	
+
+// 	while(1)
+// 	{
+		
+	}//full while
+
+}//MAIN LOOP ENDS
